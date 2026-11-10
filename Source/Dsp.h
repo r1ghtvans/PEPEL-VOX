@@ -144,6 +144,14 @@ struct OnePole
     float lp (float x) { z += a * (x - z); return z; }
 };
 
+// removes DC offset (about 10 Hz high-pass)
+struct DcBlock
+{
+    float x1 = 0, y1 = 0, r = 0.9987f;
+    void setSampleRate (double sr) { r = 1.f - kTwoPi * 10.f / (float) sr; }
+    float process (float x) { const float y = x - x1 + r * y1; x1 = x; y1 = y; return y; }
+};
+
 struct DelayLine
 {
     std::vector<float> buf;
@@ -589,6 +597,8 @@ public:
             for (auto& z : apZ[c]) z = 0;
             exHp1[c] = Biquad(); exHp2[c] = Biquad(); diAd[c] = AdaaTanh();
             bcHold[c] = 0; phLast[c] = 0; flLast[c] = 0; diLp[c] = OnePole();
+            diDc[c] = phDc[c] = flDc[c] = outDc[c] = DcBlock();
+            diDc[c].setSampleRate (sr); phDc[c].setSampleRate (sr); flDc[c].setSampleRate (sr); outDc[c].setSampleRate (sr);
         }
         dryDl[0].prepare (psola.latency() + 8); dryDl[1].prepare (psola.latency() + 8);
         hop = std::max (128, (int) (sr * 0.0058));
@@ -761,7 +771,7 @@ public:
                     float* ch[2] = { &l, &r };
                     for (int c = 0; c < 2; ++c)
                     {
-                        const float y = diLp[c].lp (diAd[c].process (*ch[c] * g + 0.08f * dr)) * (0.6f + 0.4f * comp * 3.f);
+                        const float y = diDc[c].process (diLp[c].lp (diAd[c].process (*ch[c] * g + 0.08f * dr))) * (0.6f + 0.4f * comp * 3.f);
                         *ch[c] = lerp (*ch[c], y * 0.9f, m);
                     }
                 }
@@ -780,7 +790,7 @@ public:
                         const float fc = 200.f * std::pow (20.f, x);
                         const float tn = std::tan (kPi * std::min (fc, 0.45f * (float) sr) / (float) sr);
                         const float a = (tn - 1.f) / (tn + 1.f);
-                        float y = *ch[c] + fb * phLast[c];
+                        float y = *ch[c] + fb * phDc[c].process (phLast[c]);
                         for (int s = 0; s < 6; ++s) { const float o = a * y + apZ[c][s]; apZ[c][s] = y - a * o; y = o; }
                         phLast[c] = std::tanh (y);
                         *ch[c] = *ch[c] * (1.f - 0.5f * m) + y * 0.5f * m;
@@ -797,7 +807,7 @@ public:
                     const float lfo = std::sin (kTwoPi * (flLfo.ph + 0.25f * (float) c));
                     const float dMs = 3.4f + 2.8f * lfo * dp;
                     const float del = fl[c].read (clampf (dMs * 0.001f * (float) sr, 1.f, (float) fl[c].mask - 4.f));
-                    fl[c].push (*ch[c] + clampf (fb, -0.95f, 0.95f) * std::tanh (del));
+                    fl[c].push (*ch[c] + clampf (fb, -0.95f, 0.95f) * flDc[c].process (std::tanh (del)));
                     if (m > 0.0005f) *ch[c] = *ch[c] * (1.f - 0.5f * m) + del * 0.5f * m;
                 }
             }
@@ -816,8 +826,8 @@ public:
             // ---- master
             const float gO = sOut.next(), mx = sMix.next();
             const float dl = dryDl[0].read ((float) latencySamples - 1.f), dr2 = dryDl[1].read ((float) latencySamples - 1.f);
-            l = softClip ((dl + (l - dl) * mx) * gO);
-            r = softClip ((dr2 + (r - dr2) * mx) * gO);
+            l = softClip (outDc[0].process ((dl + (l - dl) * mx) * gO));
+            r = softClip (outDc[1].process ((dr2 + (r - dr2) * mx) * gO));
             L[i] = l; R[i] = r;
         }
     }
@@ -837,6 +847,7 @@ private:
     Biquad exHp1[2], exHp2[2];
     AdaaTanh diAd[2];
     OnePole diLp[2];
+    DcBlock diDc[2], phDc[2], flDc[2], outDc[2];
     Lfo phLfo, flLfo, trLfo;
     int hop = 512, hopCount = 0, qDelay = 3, qHead = 0, exCount = 0, diCount = 0, latencySamples = 1764, curNote = 60;
     float hopMs = 5.8f;
